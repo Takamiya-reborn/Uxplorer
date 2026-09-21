@@ -1,0 +1,24 @@
+[project]
+name = "uxplorer"
+version = "0.1.0"
+description = "浏览 C:\\Users 的文件浏览器，标注目录手动更改的风险等级"
+readme = "README.md"
+authors = [
+    { name = "Takamiya-reborn", email = "2196733767@qq.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "lucide>=1.1.4",
+    "pyside6>=6.11.2",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[project.scripts]
+uxplorer = "uxplorer:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
