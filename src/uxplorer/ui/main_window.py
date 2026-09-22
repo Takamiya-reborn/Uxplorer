@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core import api
+from ..core import api, prompt_bot
 from .delegates import CardDelegate
 from .models import FileListModel, Role
 from . import theme
@@ -411,9 +411,48 @@ class MainWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self._view)
-        menu.addAction("在资源管理器中打开", lambda: api.open_in_explorer(entry.path))
-        menu.addAction("属性", lambda: api.show_properties(entry.path))
+        # Windows 上 QSS 的 border-radius 需要透明背景才能真正裁出圆角
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        icon_color = theme.TEXT_SECONDARY.name()
+        menu.addAction(
+            theme.lucide_icon("folder-open", icon_color, 16),
+            "在资源管理器中打开",
+            lambda: api.open_in_explorer(entry.path),
+        )
+        menu.addAction(
+            theme.lucide_icon("info", icon_color, 16),
+            "属性",
+            lambda: api.show_properties(entry.path),
+        )
+        menu.addSeparator()
+        menu.addAction(
+            theme.lucide_icon("copy", icon_color, 16),
+            "生成提示词并复制",
+            self._copy_prompt_for_selection,
+        )
         menu.exec(global_pos)
+
+    def _copy_prompt_for_selection(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            return
+        prompt = prompt_bot.build_prompt(
+            entries,
+            self._current,
+            self._model.risk_report,
+        )
+        QApplication.clipboard().setText(prompt)
+        self.statusBar().showMessage(f"提示词已复制（{len(entries)} 个条目）")
+
+    def _selected_entries(self) -> list[api.FileEntry]:
+        """按行号排序去重的选中条目；单选与多选统一走这里。"""
+        rows = sorted({index.row() for index in self._view.selectedIndexes()})
+        entries = []
+        for row in rows:
+            entry = self._model.index(row, 0).data(Role.EntryRole)
+            if entry is not None:
+                entries.append(entry)
+        return entries
 
     def _on_counts_changed(self, total: int, shown: int) -> None:
         if total == 0:

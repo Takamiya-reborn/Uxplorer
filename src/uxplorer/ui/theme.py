@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from importlib.resources import files
-
 import lucide
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
@@ -9,8 +7,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
 from ..core.risk_analysis import RiskLevel
-
-_QSS_DIR = files("uxplorer.ui").joinpath("qss")
+from ..resources import read_text
 
 # 颜色
 ACCENT = QColor("#0067c0")
@@ -48,6 +45,7 @@ def column_widths(total: int) -> tuple[int, ...]:
     widths = [int(content * r / ratio_sum) for r in _COLUMN_RATIOS[:-1]]
     widths.append(content - sum(widths))  # 末列兜底，吃掉取整误差
     return tuple(widths)
+
 
 # 类型颜色
 TYPE_COLORS: dict[str, QColor] = {
@@ -129,7 +127,7 @@ def apply_theme(app: QApplication, theme_name: str = "light") -> None:
         RISK_CAUTION_BG = QColor("#fdf3d5")
         RISK_SAFE_BG = QColor("#e6f4e8")
     qss_name = "dark.qss" if theme_name == "dark" else "light.qss"
-    app.setStyleSheet(_QSS_DIR.joinpath(qss_name).read_text(encoding="utf-8"))
+    app.setStyleSheet(read_text(f"qss/{qss_name}"))
 
 
 def apply_dark_theme(app: QApplication) -> None:

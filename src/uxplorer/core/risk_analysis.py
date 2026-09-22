@@ -1,9 +1,19 @@
 """分析 C:\\Users 下目录的重要程度，评估手动更改的风险等级。
 
-等级定义：
+等级定义（以“应用能否继续正常工作”为标准）：
 - 高危：手动更改会导致系统无法正常运行；
 - 存疑：手动更改会导致某些应用失去记录或者无法正常运行；
-- 安全：是缓存文件，不会导致数据丢失，也不会导致错误。
+- 安全：删除后应用仍可正常工作，内容会自动重建或从网络重新下载，
+  代价（如需重新下载依赖、丢失对话历史）在 advice 中提醒。
+
+除综合等级外，结果还区分“删除风险”与“修改风险”两个维度：
+有些目录删除安全但修改危险（如 node_modules），有些目录删除会丢数据
+但修改内容无妨（如 Desktop）。“容器”类目录（如用户根目录）本身
+不可删除或重命名，但内部子项可独立管理。
+
+具体规则（名称/前缀匹配表、采样参数）由 SQLite 规则库 rules.db 提供
+（见 rule_store.py 与 scripts/rules_seed.sql）；本模块只保留匹配
+引擎与采样逻辑。规则库缺失或损坏时，所有路径保守回退为“存疑”。
 """
 
 from __future__ import annotations
@@ -15,8 +25,9 @@ from enum import Enum
 from pathlib import Path
 
 from .api import ROOT, is_within_root
+from .rule_store import RuleSet, get_rule_set
 
-__all__ = ["RiskLevel", "RiskReport", "analyze_risk"]
+__all__ = ["RiskLevel", "RiskReport", "analyze_risk", "path_access_summary"]
 
 
 class RiskLevel(Enum):
@@ -40,94 +51,29 @@ _LABELS = {
 
 @dataclass(frozen=True)
 class RiskReport:
-    """风险分析结果。"""
+    """风险分析结果。
+
+    level 是用于展示的综合等级；删除与修改两个维度未显式给出时
+    （None）与综合等级一致。
+    """
 
     path: Path
     level: RiskLevel
     reason: str
     rule: str
+    delete_risk: RiskLevel | None = None  # 删除整个目录的风险
+    modify_risk: RiskLevel | None = None  # 手动修改内部文件的风险
+    is_container: bool = False  # 容器：本身不可动，但子项可独立管理
+    advice: str = ""  # 具体操作建议
+    evidence: str = ""  # 采样证据（动态生成的数字或文件特征）
 
+    @property
+    def delete_level(self) -> RiskLevel:
+        return self.delete_risk if self.delete_risk is not None else self.level
 
-# 个人数据目录（相对用户根目录的第一段），误删会造成数据丢失
-_USER_DATA_DIRS = frozenset(
-    {
-        "desktop",
-        "documents",
-        "downloads",
-        "pictures",
-        "music",
-        "videos",
-        "favorites",
-        "contacts",
-        "links",
-        "saved games",
-        "searches",
-        "3d objects",
-    }
-)
-
-# 强缓存特征名称：在任何位置出现都视为缓存，可清理
-_STRONG_CACHE_NAMES = frozenset(
-    {
-        "temp",
-        "tmp",
-        "crashpad",
-        ".temp",
-        ".tmp",
-    }
-)
-
-# 可整体删除后由工具链重建的开发环境依赖目录：
-# “删除安全”不等于“修改安全”，内部文件不应手动改动
-_REBUILDABLE_CACHE_NAMES = frozenset(
-    {
-        "node_modules",
-        "__pycache__",
-        "venv",
-        ".venv",
-        "pnpm-store",
-    }
-)
-
-# AppData 规则表，按最长前缀匹配
-_APPDATA_RULES: tuple[tuple[tuple[str, ...], RiskLevel, str], ...] = (
-    (
-        ("appdata", "local", "microsoft", "windows"),
-        RiskLevel.HIGH,
-        "包含 UsrClass.dat 注册表配置单元等系统关键数据",
-    ),
-    (
-        ("appdata", "local", "microsoft"),
-        RiskLevel.QUESTIONABLE,
-        "微软组件的用户数据与配置",
-    ),
-    (
-        ("appdata", "local", "packages"),
-        RiskLevel.QUESTIONABLE,
-        "UWP 应用沙盒数据，误删会导致应用重置或需要重新登录",
-    ),
-    (("appdata", "local"), RiskLevel.QUESTIONABLE, "应用本地数据与配置"),
-    (("appdata", "roaming"), RiskLevel.QUESTIONABLE, "应用漫游数据与配置"),
-    (("appdata", "locallow"), RiskLevel.QUESTIONABLE, "应用低完整性级别数据"),
-    (("appdata",), RiskLevel.HIGH, "AppData 根目录，删除会同时破坏系统组件与应用数据"),
-)
-
-# 采样时使用的扩展名特征
-_HIVE_NAMES = ("ntuser.dat", "usrclass.dat")
-_CACHE_EXTS = frozenset({"tmp", "temp", "log", "bak", "old", "dmp"})
-_CONFIG_EXTS = frozenset({"json", "ini", "cfg", "conf", "db", "dat", "xml", "sqlite"})
-# 重要配置扩展名：出现即可一票否决“安全”判定。
-# 不含 .db/.sqlite——SQLite 库常与 .log 形式的 WAL 日志混放，
-# 这类混合目录交给缓存比例判定处理
-_VETO_CONFIG_EXTS = frozenset({"json", "ini", "dat"})
-# 系统自动生成的杂项文件，不参与内容与同级判定
-_IGNORED_FILE_NAMES = frozenset({"desktop.ini", "thumbs.db"})
-# 缓存目录的同级配置文件特征：命中则缓存可能保存了应用状态
-_SIBLING_CONFIG_EXTS = frozenset({"json", "ini"})
-# 视为系统组件的目录所有者账户名
-_SYSTEM_OWNER_ACCOUNTS = frozenset({"system", "trustedinstaller"})
-
-_SAMPLE_LIMIT = 512
+    @property
+    def modify_level(self) -> RiskLevel:
+        return self.modify_risk if self.modify_risk is not None else self.level
 
 
 def analyze_risk(path: str | Path) -> RiskReport:
@@ -160,101 +106,37 @@ def analyze_risk(path: str | Path) -> RiskReport:
             "system-link",
         )
 
-    # 第一段是用户名，其余是相对用户根目录的路径
+    # 相对用户根目录的小写段序列（如 AppData\Local → ('appdata', 'local')）；
+    # 空序列表示 C:\Users 下的直接子目录（用户配置文件根）
     under_user = tuple(part.lower() for part in target.relative_to(ROOT).parts[1:])
 
-    if not under_user:
-        return RiskReport(
-            target,
-            RiskLevel.HIGH,
-            "用户配置文件根目录，包含注册表配置单元和系统必需数据",
-            "profile-root",
-        )
-
-    first = under_user[0]
-    last = under_user[-1]
-
-    # OneDrive 同步目录（精确的 OneDrive，或 "OneDrive - 公司" 形式的变体；
-    # 不匹配用户自建的 OneDriveBackup 之类文件夹）
-    if first == "onedrive" or first.startswith("onedrive -"):
+    # 越界与系统链接检查不依赖规则库，仍正常工作
+    rules = get_rule_set()
+    if not rules.available:
         return RiskReport(
             target,
             RiskLevel.QUESTIONABLE,
-            "OneDrive 同步的个人文件，误删会造成数据丢失",
-            "onedrive",
+            "规则库缺失或损坏，默认视为重要数据",
+            "rules-missing",
         )
 
-    # 个人数据目录
-    if first in _USER_DATA_DIRS:
-        return RiskReport(
-            target,
-            RiskLevel.QUESTIONABLE,
-            "个人文件目录，误删会造成数据丢失",
-            "user-data",
-        )
-
-    # 可整体删除重建的开发环境依赖（node_modules、venv 等）
-    if _is_rebuildable_cache_name(last):
-        return RiskReport(
-            target,
-            RiskLevel.SAFE,
-            "开发环境依赖，可整体删除后重建，但不建议手动修改内部文件",
-            "rebuildable-cache-name",
-        )
-
-    # 缓存特征名称（优先于 AppData 规则，如 AppData\\Local\\Temp）；
-    # 同级存在配置文件时降级为存疑——缓存可能保存了应用状态
-    is_strong_cache = _is_strong_cache_name(last)
-    if is_strong_cache or _is_weak_cache_name(last):
-        if _has_config_sibling(target):
+    # 静态规则：按优先级依次检查，首个命中生效
+    for rule, matcher in rules.matchers:
+        if matcher(under_user):
             return RiskReport(
-                target,
-                RiskLevel.QUESTIONABLE,
-                "缓存目录，但同级存在配置文件，可能保存应用状态，建议关闭应用后清理",
-                "cache-config-sibling",
-            )
-        if is_strong_cache:
-            return RiskReport(
-                target,
-                RiskLevel.SAFE,
-                "名称表明是缓存或临时目录，内容可自动重建",
-                "strong-cache-name",
-            )
-        return RiskReport(
             target,
-            RiskLevel.SAFE,
-            "名称以 cache 结尾，通常为可安全清理的缓存",
-            "weak-cache-name",
-        )
-
-    # AppData 规则（最长前缀优先）
-    if first == "appdata":
-        for segments, level, reason in _APPDATA_RULES:
-            if under_user[: len(segments)] == segments:
-                return RiskReport(target, level, reason, "appdata-prefix")
-
-    # 用户根目录下的注册表配置单元及其事务日志（NTUSER.DAT.LOG1、{guid}.TxLog 等），
-    # 不匹配 ntuser.ini 等用户自建文件
-    if last.startswith("ntuser.dat"):
-        return RiskReport(
-            target,
-            RiskLevel.HIGH,
-            "用户注册表配置单元，损坏会导致无法登录",
-            "ntuser-file",
-        )
-
-    # 点开头的开发工具/运行环境配置目录（.ssh、.docker 等）
-    if first.startswith("."):
-        return RiskReport(
-            target,
-            RiskLevel.QUESTIONABLE,
-            "开发工具或运行环境的配置目录，删除会导致工具失去配置",
-            "dot-dir",
+            RiskLevel(rule.level),
+            rule.reason,
+            rule.rule_id,
+            delete_risk=_optional_level(rule.delete_risk),
+            modify_risk=_optional_level(rule.modify_risk),
+            is_container=rule.is_container,
+            advice=rule.advice,
         )
 
     # 其余目录根据内容元数据采样判断
     if target.is_dir():
-        return _analyze_by_sampling(target)
+        return _analyze_by_sampling(target, rules)
 
     return RiskReport(
         target,
@@ -262,6 +144,11 @@ def analyze_risk(path: str | Path) -> RiskReport:
         "未知内容，默认视为重要数据",
         "default",
     )
+
+
+def _optional_level(value: str | None) -> RiskLevel | None:
+    """把规则库中的等级文本转换为 RiskLevel；空值保持 None（跟随综合等级）。"""
+    return RiskLevel(value) if value else None
 
 
 def _is_lexically_within_root(path: Path) -> bool:
@@ -283,95 +170,190 @@ def _is_reparse_point(path: Path) -> bool:
     return bool(attributes & stat_mod.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def _is_strong_cache_name(name: str) -> bool:
-    return name in _STRONG_CACHE_NAMES or (
-        name.startswith(".") and name.endswith("_cache")
-    )
-
-
-def _is_rebuildable_cache_name(name: str) -> bool:
-    return name in _REBUILDABLE_CACHE_NAMES
-
-
-def _is_weak_cache_name(name: str) -> bool:
-    return name.endswith(("cache", "caches"))
-
-
-def _has_config_sibling(path: Path) -> bool:
-    """检查缓存目录的同级文件里是否有配置文件（desktop.ini 等系统杂项除外）。"""
-    try:
-        with os.scandir(path.parent) as iterator:
-            for entry in iterator:
-                if entry.is_dir(follow_symlinks=False):
-                    continue
-                name = entry.name.lower()
-                if name in _IGNORED_FILE_NAMES:
-                    continue
-                ext = name.rsplit(".", 1)[-1] if "." in name else ""
-                if ext in _SIBLING_CONFIG_EXTS:
-                    return True
-    except OSError:
-        return False
-    return False
-
-
 def _path_owner(path: Path) -> str | None:
     """返回目录所有者的“域名\\账户名”（如 NT AUTHORITY\\SYSTEM）；失败返回 None。"""
     if os.name != "nt":
         return None
     import ctypes
-    from ctypes import wintypes
 
     # SE_FILE_OBJECT=1，OWNER_SECURITY_INFORMATION=1；
     # owner_sid 指向 descriptor 内部，不能单独释放，最后整体释放 descriptor 即可
     owner_sid = ctypes.c_void_p()
     descriptor = ctypes.c_void_p()
-    # 超长路径需要扩展前缀，否则 API 会拒绝
-    object_name = str(path)
-    if len(object_name) >= 248:
-        object_name = f"\\\\?\\{object_name}"
-    result = ctypes.windll.advapi32.GetNamedSecurityInfoW(
-        object_name,
-        1,
-        1,
-        ctypes.byref(owner_sid),
-        None,
-        None,
-        None,
-        ctypes.byref(descriptor),
-    )
-    if result != 0 or not owner_sid.value or not descriptor.value:
+    if _get_named_security_info(str(path), 1, owner_sid, None, descriptor):
         return None
     try:
-        name = ctypes.create_unicode_buffer(256)
-        domain = ctypes.create_unicode_buffer(256)
-        name_len = wintypes.DWORD(256)
-        domain_len = wintypes.DWORD(256)
-        use = wintypes.DWORD()
-        if not ctypes.windll.advapi32.LookupAccountSidW(
-            None,
-            owner_sid,
-            name,
-            ctypes.byref(name_len),
-            domain,
-            ctypes.byref(domain_len),
-            ctypes.byref(use),
-        ):
-            return None
-        if domain.value:
-            return f"{domain.value}\\{name.value}"
-        return name.value
+        return _sid_to_account(owner_sid)
     finally:
         ctypes.windll.kernel32.LocalFree(descriptor)
 
 
-def _is_system_owner(owner: str) -> bool:
+def path_access_summary(path: Path) -> str | None:
+    """目录的访问控制摘要，供提示词生成使用。
+
+    返回如 "所有者：NT AUTHORITY\\SYSTEM；访问控制：
+    SYSTEM 完全控制、Administrators 完全控制、<用户名> 修改"；
+    非 Windows 或读取失败时返回 None。账户名可能含真实用户名，
+    调用方需自行脱敏。
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    # SE_FILE_OBJECT=1，OWNER|DACL_SECURITY_INFORMATION=1|4=5
+    owner_sid = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    if _get_named_security_info(str(path), 5, owner_sid, dacl, descriptor):
+        return None
+    try:
+        parts = []
+        owner = _sid_to_account(owner_sid)
+        if owner:
+            parts.append(f"所有者：{owner}")
+        if dacl.value:
+            entries = _dacl_entries(dacl)
+            if entries:
+                parts.append("访问控制：" + "、".join(entries))
+        return "；".join(parts) if parts else None
+    finally:
+        ctypes.windll.kernel32.LocalFree(descriptor)
+
+
+def _get_named_security_info(
+    object_name: str,
+    security_info: int,
+    owner_sid,
+    dacl,
+    descriptor,
+) -> int:
+    """GetNamedSecurityInfoW 的薄封装；返回错误码（0 表示成功）。
+
+    owner_sid / dacl / descriptor 均为 ctypes.c_void_p，由调用方释放 descriptor。
+    """
+    import ctypes
+
+    # 超长路径需要扩展前缀，否则 API 会拒绝
+    if len(object_name) >= 248:
+        object_name = f"\\\\?\\{object_name}"
+    # 参数依次为：对象名、SE_FILE_OBJECT、信息类别、owner、group、dacl、sacl、descriptor
+    return ctypes.windll.advapi32.GetNamedSecurityInfoW(
+        object_name,
+        1,
+        security_info,
+        ctypes.byref(owner_sid) if owner_sid is not None else None,
+        None,
+        ctypes.byref(dacl) if dacl is not None else None,
+        None,
+        ctypes.byref(descriptor),
+    )
+
+
+def _sid_to_account(sid) -> str | None:
+    """SID -> “域名\\账户名”；失败返回 None。"""
+    import ctypes
+    from ctypes import wintypes
+
+    name = ctypes.create_unicode_buffer(256)
+    domain = ctypes.create_unicode_buffer(256)
+    name_len = wintypes.DWORD(256)
+    domain_len = wintypes.DWORD(256)
+    use = wintypes.DWORD()
+    if not ctypes.windll.advapi32.LookupAccountSidW(
+        None,
+        sid,
+        name,
+        ctypes.byref(name_len),
+        domain,
+        ctypes.byref(domain_len),
+        ctypes.byref(use),
+    ):
+        return None
+    if domain.value:
+        return f"{domain.value}\\{name.value}"
+    return name.value
+
+
+# 访问掩码分类用的位（含通用权限位与目录的特定权限位）
+_MASK_FULL = 0x10000000 | 0x001F01FF  # GENERIC_ALL | FILE_ALL_ACCESS
+_MASK_WRITE = 0x40000000 | 0x2 | 0x4 | 0x10000  # GENERIC_WRITE | 建文件/建目录 | DELETE
+_MASK_READ = 0x80000000 | 0x1 | 0x20000  # GENERIC_READ | 列目录 | READ_CONTROL
+# 访问控制摘要里最多列出的账户数，其余合并为“等”
+_MAX_ACL_ACCOUNTS = 6
+# 权限高低的排序依据，同一账户出现多条 ACE 时保留最高一条
+_LEVEL_RANK = {"完全控制": 2, "修改": 1, "读取": 0}
+
+
+def _dacl_entries(dacl) -> list[str]:
+    """把 DACL 压缩为“账户 权限”列表；同一账户保留最高权限。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _ACL_SIZE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    # ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE 布局相同：
+    # ACE_HEADER(4字节) + Mask(4字节) + SidStart(SID 起始)
+    class _ACE(ctypes.Structure):
+        _fields_ = [
+            ("AceType", wintypes.BYTE),
+            ("AceFlags", wintypes.BYTE),
+            ("AceSize", wintypes.WORD),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    info = _ACL_SIZE_INFORMATION()
+    # ACLSecurityInformation = 2（AclSizeInformation）
+    if not ctypes.windll.advapi32.GetAclInformation(
+        dacl, ctypes.byref(info), ctypes.sizeof(info), 2
+    ):
+        return []
+
+    best: dict[str, str] = {}
+    for i in range(info.AceCount):
+        ace = ctypes.c_void_p()
+        if not ctypes.windll.advapi32.GetAce(dacl, i, ctypes.byref(ace)) or not ace.value:
+            continue
+        ace_struct = ctypes.cast(ace, ctypes.POINTER(_ACE)).contents
+        account = _sid_to_account(
+            ctypes.c_void_p(ctypes.addressof(ace_struct) + _ACE.SidStart.offset)
+        )
+        if not account:
+            continue
+        mask = ace_struct.Mask
+        if mask & _MASK_FULL:
+            level = "完全控制"
+        elif mask & _MASK_WRITE:
+            level = "修改"
+        elif mask & _MASK_READ:
+            level = "读取"
+        else:
+            level = "特殊权限"
+        if ace_struct.AceType == 1:  # ACCESS_DENIED_ACE_TYPE
+            level = f"拒绝{level}"
+        if account not in best or _LEVEL_RANK.get(level, -1) > _LEVEL_RANK.get(
+            best[account], -1
+        ):
+            best[account] = level
+    entries = [f"{account} {level}" for account, level in best.items()]
+    if len(entries) > _MAX_ACL_ACCOUNTS:
+        entries = entries[:_MAX_ACL_ACCOUNTS]
+        entries.append("等")
+    return entries
+
+
+def _is_system_owner(owner: str, accounts: frozenset[str]) -> bool:
     """所有者账户名是否为 SYSTEM 或 TrustedInstaller 等系统主体。"""
     account = owner.rsplit("\\", 1)[-1].strip().lower()
-    return account in _SYSTEM_OWNER_ACCOUNTS
+    return account in accounts
 
 
-def _analyze_by_sampling(path: Path) -> RiskReport:
+def _analyze_by_sampling(path: Path, rules: RuleSet) -> RiskReport:
     """扫描目录内文件的元数据，推断风险等级。"""
     try:
         stat_result = path.stat()
@@ -389,7 +371,9 @@ def _analyze_by_sampling(path: Path) -> RiskReport:
 
     # 所有者为 SYSTEM / TrustedInstaller 的目录不是用户数据（如 Public、Default）
     owner = _path_owner(path)
-    if owner is not None and _is_system_owner(owner):
+    if owner is not None and _is_system_owner(
+        owner, rules.param_set("system_owner_accounts")
+    ):
         return RiskReport(
             path,
             RiskLevel.QUESTIONABLE,
@@ -397,33 +381,47 @@ def _analyze_by_sampling(path: Path) -> RiskReport:
             "sample-system-owner",
         )
 
+    hive_names = rules.param_set("hive_names")
+    ignored_names = rules.param_set("ignored_file_names")
+    cache_exts = rules.param_set("cache_exts")
+    config_exts = rules.param_set("config_exts")
+    veto_exts = rules.param_set("veto_config_exts")
+    sample_limit = rules.param_int("sample_limit")
+    cache_heavy_ratio = rules.param_float("cache_heavy_ratio")
+    cache_heavy_min_files = rules.param_int("cache_heavy_min_files")
+
     file_count = 0
+    dir_count = 0
     cache_count = 0
     has_config = False
     has_hive = False
     has_veto_config = False
+    veto_names: list[str] = []
     try:
         with os.scandir(path) as iterator:
             for index, entry in enumerate(iterator):
-                if index >= _SAMPLE_LIMIT:
+                if index >= sample_limit:
                     break
                 name = entry.name.lower()
-                if name.startswith("ntuser.dat") or name in _HIVE_NAMES:
+                if name.startswith("ntuser.dat") or name in hive_names:
                     has_hive = True
                     break  # 配置单元足以定性，无需继续采样
-                if name in _IGNORED_FILE_NAMES:
+                if name in ignored_names:
                     continue  # 系统自动生成的杂项文件不参与判定
                 if entry.is_dir(follow_symlinks=False):
+                    dir_count += 1
                     continue
                 file_count += 1
                 ext = name.rsplit(".", 1)[-1] if "." in name else ""
-                if ext in _CACHE_EXTS or "cache" in name:
+                if ext in cache_exts or "cache" in name:
                     cache_count += 1
-                if ext in _CONFIG_EXTS:
+                if ext in config_exts:
                     has_config = True
-                    if ext in _VETO_CONFIG_EXTS:
+                    if ext in veto_exts:
                         # 重要配置（.json/.ini/.dat）一票否决“安全”，无需继续采样
                         has_veto_config = True
+                        if len(veto_names) < 3:
+                            veto_names.append(entry.name)
                         break
     except OSError:
         return _unknown(path)
@@ -439,28 +437,40 @@ def _analyze_by_sampling(path: Path) -> RiskReport:
         return RiskReport(
             path,
             RiskLevel.QUESTIONABLE,
-            "包含 .json/.ini/.dat 等重要配置文件，不建议清理",
+            "包含 .json/.ini/.dat 等重要配置文件，手动修改可能导致应用崩溃"
+            "或数据丢失，建议仅备份不修改",
             "sample-veto-config",
+            evidence=f"采样发现 {'、'.join(veto_names)} 等配置文件",
+        )
+    if file_count == 0 and dir_count == 0:
+        return RiskReport(
+            path,
+            RiskLevel.SAFE,
+            "空目录，删除后应用需要时会自动重建",
+            "sample-empty",
         )
     if file_count == 0:
         return RiskReport(
             path,
             RiskLevel.QUESTIONABLE,
-            "目录为空，无法根据内容判断",
-            "sample-empty",
+            "目录下只有子文件夹，无法直接判断内容",
+            "sample-subdirs-only",
         )
-    if file_count >= 8 and cache_count / file_count >= 0.8:
+    if (
+        file_count >= cache_heavy_min_files
+        and cache_count / file_count >= cache_heavy_ratio
+    ):
         return RiskReport(
             path,
             RiskLevel.SAFE,
-            "内容以缓存和临时文件为主，可安全清理",
+            f"采样 {file_count} 个文件，{cache_count} 个为缓存或临时文件，可安全清理",
             "sample-cache-heavy",
         )
     if has_config:
         return RiskReport(
             path,
             RiskLevel.QUESTIONABLE,
-            "包含应用配置或数据库文件，删除会导致应用失去记录",
+            "采样发现配置与数据库文件，删除会导致应用失去记录",
             "sample-config-files",
         )
     return _unknown(path, "无法确定内容，默认视为重要数据")

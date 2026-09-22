@@ -87,6 +87,13 @@ class FileListModel(QAbstractListModel):
                 continue  # 分析失败的项目不着色
         self._reflow()
 
+    def entries(self) -> list[FileEntry]:
+        """当前目录的全部条目（未经搜索过滤），供提示词等复用。"""
+        return list(self._entries)
+
+    def risk_report(self, path: Path) -> RiskReport | None:
+        return self._risks.get(path)
+
     def set_sort(self, field: str, descending: bool) -> None:
         if not is_valid_sort_field(field):
             return
@@ -113,11 +120,19 @@ class FileListModel(QAbstractListModel):
         self.countsChanged.emit(len(self._entries), len(self._shown))
 
     def _tooltip(self, entry: FileEntry) -> str:
-        # 基本信息（名称/大小/修改时间）已在列表中展示，悬浮时只补充风险等级
+        # 基本信息（名称/大小/修改时间）已在列表中展示，悬浮时只补充风险详情
         report = self._risks.get(entry.path)
         if report is None:
             return ""
-        return (
-            f"<b>风险等级：{report.level.label}</b><br/>"
-            f"{html.escape(report.reason)}"
+        lines = [f"<b>风险等级：{report.level.label}</b>"]
+        if report.is_container:
+            lines.append("此目录为系统容器：本身不可删除或重命名，内部子项可独立管理")
+        lines.append(
+            f"删除风险：{report.delete_level.label}　修改风险：{report.modify_level.label}"
         )
+        lines.append(html.escape(report.reason))
+        if report.evidence:
+            lines.append(html.escape(report.evidence))
+        if report.advice:
+            lines.append(f"建议：{html.escape(report.advice)}")
+        return "<br/>".join(lines)
